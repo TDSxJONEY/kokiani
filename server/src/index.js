@@ -18,13 +18,13 @@ app.get("/health", async (_req, res) => {
     const engineRes = await fetch(`${LOCAL_ENGINE_URL}/health`);
     const engineData = engineRes.ok ? await engineRes.json() : null;
     res.json({
-      ok: true,
+      ok: Boolean(engineData?.ok),
       service: "transcripto-api",
       localEngine: engineData || { ok: false }
     });
   } catch {
-    res.json({
-      ok: true,
+    res.status(503).json({
+      ok: false,
       service: "transcripto-api",
       localEngine: { ok: false, error: "Local engine unreachable" }
     });
@@ -43,8 +43,11 @@ app.post("/api/transcribe", upload.single("audio"), async (req, res) => {
     });
     formData.append("audio", audioBlob, req.file.originalname || "browser-audio.webm");
 
-    if (req.body?.language) {
-      formData.append("language", req.body.language);
+    const optionalFields = ["language", "task", "model_size", "initial_prompt"];
+    for (const field of optionalFields) {
+      if (req.body?.[field]) {
+        formData.append(field, String(req.body[field]));
+      }
     }
 
     const engineResponse = await fetch(`${LOCAL_ENGINE_URL}/transcribe`, {
@@ -60,6 +63,7 @@ app.post("/api/transcribe", upload.single("audio"), async (req, res) => {
     res.json({
       text: result.text,
       language: result.language || null,
+      duration: result.duration || 0,
       segments: result.segments || []
     });
   } catch (error) {

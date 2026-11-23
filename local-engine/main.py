@@ -1,27 +1,35 @@
 from contextlib import asynccontextmanager
 import os
 import tempfile
-from typing import Optional
+from typing import Dict, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from faster_whisper import WhisperModel
 
-MODEL_SIZE = os.getenv("WHISPER_MODEL", "base")
+DEFAULT_MODEL = os.getenv("WHISPER_MODEL", "base")
 CPU_THREADS = int(os.getenv("WHISPER_CPU_THREADS", "4"))
+ALLOWED_MODELS = {"base", "small"}
 
-ml_models = {}
+ml_models: Dict[str, WhisperModel] = {}
+
+
+def get_or_load_model(model_name: str) -> WhisperModel:
+    target = model_name if model_name in ALLOWED_MODELS else DEFAULT_MODEL
+    if target not in ml_models:
+        print(f"Loading Faster-Whisper '{target}' (CPU, INT8, threads={CPU_THREADS})...")
+        ml_models[target] = WhisperModel(
+            target,
+            device="cpu",
+            compute_type="int8",
+            cpu_threads=CPU_THREADS,
+        )
+        print(f"Faster-Whisper '{target}' ready.")
+    return ml_models[target]
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print(f"Loading Faster-Whisper '{MODEL_SIZE}' (CPU, INT8, threads={CPU_THREADS})...")
-    ml_models["whisper"] = WhisperModel(
-        MODEL_SIZE,
-        device="cpu",
-        compute_type="int8",
-        cpu_threads=CPU_THREADS,
-    )
-    print("Faster-Whisper model ready.")
+    get_or_load_model(DEFAULT_MODEL)
     yield
     ml_models.clear()
 
@@ -34,7 +42,7 @@ def health():
     return {
         "ok": True,
         "service": "transcripto-local-engine",
-        "model": MODEL_SIZE,
+        "loaded_models": list(ml_models.keys()),
         "compute_type": "int8",
         "cpu_threads": CPU_THREADS,
     }
@@ -44,11 +52,10 @@ def health():
 async def transcribe(
     audio: UploadFile = File(...),
     language: Optional[str] = Form(default=None),
+    task: Optional[str] = Form(default="transcribe"),
+    model_size: Optional[str] = Form(default="base"),
+    initial_prompt: Optional[str] = Form(default=None),
 ):
-    model: WhisperModel = ml_models.get("whisper")
-    if model is None:
-        raise HTTPException(status_code=503, detail="Whisper model is not loaded yet.")
-
     suffix = os.path.splitext(audio.filename or "audio.webm")[1] or ".webm"
     temp_path = None
 
@@ -57,17 +64,26 @@ async def transcribe(
         if not contents:
             raise HTTPException(status_code=400, detail="Empty audio file.")
 
+        model = get_or_load_model((model_size or DEFAULT_MODEL).strip().lower())
+
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(contents)
             temp_path = tmp.name
 
         lang_arg = language.strip() if language and language.strip() else None
+        task_arg = "translate" if (task and task.strip().lower() == "translate") else "transcribe"
+        prompt_arg = initial_prompt.strip() if initial_prompt and initial_prompt.strip() else None
 
         segments_gen, info = model.transcribe(
             temp_path,
             language=lang_arg,
+            task=task_arg,
+            initial_prompt=prompt_arg,
             beam_size=5,
+            condition_on_previous_text=False,
+            no_speech_threshold=0.6,
             vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 500},
         )
 
         segments = []

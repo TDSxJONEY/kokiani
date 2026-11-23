@@ -2,6 +2,7 @@ let recorder = null;
 let capturedStream = null;
 let audioContext = null;
 let chunks = [];
+let activeOptions = {};
 
 async function setState(state) {
   await chrome.runtime.sendMessage({
@@ -19,6 +20,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       if (message.type === "START_RECORDING") {
         if (recorder?.state === "recording") throw new Error("A capture is already running.");
 
+        activeOptions = message.options || {};
+
         capturedStream = await navigator.mediaDevices.getUserMedia({
           audio: {
             mandatory: {
@@ -29,7 +32,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           video: false
         });
 
-        // tabCapture mutes the tab's normal audio output unless we route it back.
+        // Keep normal tab playback audible while capturing
         audioContext = new AudioContext();
         const source = audioContext.createMediaStreamSource(capturedStream);
         source.connect(audioContext.destination);
@@ -46,10 +49,22 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
         recorder.onstop = async () => {
           try {
-            await setState({ phase: "transcribing", status: "Uploading audio for transcription…" });
+            await setState({
+              phase: "transcribing",
+              status: `Transcribing (${activeOptions.model_size || "base"})…`,
+              tabTitle: activeOptions.tabTitle
+            });
+
             const audioBlob = new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
             const formData = new FormData();
             formData.append("audio", audioBlob, "browser-audio.webm");
+
+            if (activeOptions.language) formData.append("language", activeOptions.language);
+            if (activeOptions.task) formData.append("task", activeOptions.task);
+            if (activeOptions.model_size) formData.append("model_size", activeOptions.model_size);
+            if (activeOptions.initial_prompt) {
+              formData.append("initial_prompt", activeOptions.initial_prompt);
+            }
 
             const response = await fetch("http://localhost:8787/api/transcribe", {
               method: "POST",
@@ -60,8 +75,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
             await setState({
               phase: "done",
-              status: `Transcription complete${result.language ? ` · ${result.language}` : ""}`,
-              transcript: result.text || "(No speech detected.)"
+              status: `Completed · ${result.language || "auto"} (${activeOptions.model_size || "base"})`,
+              transcript: result.text || "(No speech detected.)",
+              segments: result.segments || [],
+              language: result.language || null,
+              task: activeOptions.task || "transcribe",
+              tabTitle: activeOptions.tabTitle
             });
           } catch (error) {
             await setState({
@@ -80,7 +99,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         };
 
         recorder.start();
-        await setState({ phase: "recording", status: "Recording tab audio…" });
+        await setState({
+          phase: "recording",
+          status: "Recording tab audio…",
+          startedAt: Date.now(),
+          tabTitle: activeOptions.tabTitle
+        });
         sendResponse({ ok: true });
         return;
       }

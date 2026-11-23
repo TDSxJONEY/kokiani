@@ -1,17 +1,34 @@
-async function ensureOffscreenDocument() {
-  const url = chrome.runtime.getURL("offscreen.html");
+const OFFSCREEN_PATH = "offscreen.html";
+
+async function hasOffscreenDocument() {
+  const url = chrome.runtime.getURL(OFFSCREEN_PATH);
   const contexts = await chrome.runtime.getContexts({
     contextTypes: ["OFFSCREEN_DOCUMENT"],
     documentUrls: [url]
   });
+  return contexts.length > 0;
+}
 
-  if (contexts.length === 0) {
+async function ensureOffscreenDocument() {
+  if (!(await hasOffscreenDocument())) {
     await chrome.offscreen.createDocument({
-      url: "offscreen.html",
+      url: OFFSCREEN_PATH,
       reasons: ["USER_MEDIA"],
       justification: "Capture audio from the tab selected by the user for transcription."
     });
   }
+}
+
+async function closeOffscreenDocument() {
+  if (await hasOffscreenDocument()) {
+    await chrome.offscreen.closeDocument();
+  }
+}
+
+async function saveToHistory(entry) {
+  const { transcriptoHistory = [] } = await chrome.storage.local.get("transcriptoHistory");
+  const updated = [entry, ...transcriptoHistory].slice(0, 8);
+  await chrome.storage.local.set({ transcriptoHistory: updated });
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -19,6 +36,17 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     try {
       if (message.target === "background" && message.type === "SET_STATE") {
         await chrome.storage.local.set({ transcriptoState: message.state });
+        if (message.state?.phase === "done" && message.state?.transcript) {
+          await saveToHistory({
+            id: Date.now(),
+            createdAt: new Date().toISOString(),
+            tabTitle: message.state.tabTitle || "Browser Tab",
+            language: message.state.language || "auto",
+            task: message.state.task || "transcribe",
+            transcript: message.state.transcript,
+            segments: message.state.segments || []
+          });
+        }
         sendResponse({ ok: true });
         return;
       }
@@ -32,7 +60,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         const result = await chrome.runtime.sendMessage({
           target: "offscreen",
           type: "START_RECORDING",
-          streamId
+          streamId,
+          options: {
+            ...(message.options || {}),
+            tabTitle: tab.title || "Browser Tab"
+          }
         });
         if (!result?.ok) throw new Error(result?.error || "Offscreen capture failed.");
         sendResponse({ ok: true });
@@ -45,6 +77,21 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           type: "STOP_RECORDING"
         });
         sendResponse(result || { ok: true });
+        return;
+      }
+
+      if (message.type === "FORCE_RESET") {
+        await closeOffscreenDocument();
+        await chrome.storage.local.set({
+          transcriptoState: {
+            phase: "idle",
+            status: "Ready",
+            transcript: "",
+            segments: [],
+            error: ""
+          }
+        });
+        sendResponse({ ok: true });
         return;
       }
     } catch (error) {
