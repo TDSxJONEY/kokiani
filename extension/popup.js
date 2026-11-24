@@ -25,9 +25,9 @@ const LANGUAGE_PRESETS = {
 
 let currentState = {};
 let historyItems = [];
+let activePage = "studio"; // "studio" | "history"
 let activeView = "paragraph"; // "paragraph" | "segments"
 let searchQuery = "";
-let historyOpen = false;
 let timerInterval = null;
 let engineOnline = null;
 
@@ -92,7 +92,7 @@ function updateHealthBadge() {
     engineOnline === null ? "" : engineOnline ? "online" : "offline"
   }`;
   pill.innerHTML = `<span class="dot"></span>${
-    engineOnline === null ? "Checking…" : engineOnline ? "Local Ready" : "Engine Offline"
+    engineOnline === null ? "Checking" : engineOnline ? "Ready" : "Offline"
   }`;
 }
 
@@ -115,98 +115,116 @@ function syncTimer() {
   }
 }
 
+function switchPage(page) {
+  activePage = page;
+  document.getElementById("nav-studio").classList.toggle("active", page === "studio");
+  document.getElementById("nav-history").classList.toggle("active", page === "history");
+  document.getElementById("view-studio").classList.toggle("hidden", page !== "studio");
+  document.getElementById("view-history").classList.toggle("hidden", page !== "history");
+}
+
 function initShell() {
   const isSidePanel = document.body.classList.contains("is-sidepanel");
   const app = document.getElementById("app");
   app.innerHTML = `
-    <div class="container">
-      <div class="header">
-        <div class="brand">
-          <h1>Transcripto</h1>
-          <span id="health-pill" class="health-pill"><span class="dot"></span>Checking…</span>
+    <div class="app-shell">
+      <div class="topbar">
+        <div class="brand-group">
+          <div class="app-icon">T</div>
+          <span class="brand-title">Transcripto</span>
+          <span id="health-pill" class="health-pill"><span class="dot"></span>Checking</span>
         </div>
-        <div style="display:flex;gap:6px;">
+        <div class="nav-actions">
           ${
             !isSidePanel
-              ? `<button id="dock-btn" class="icon-btn" title="Open persistent Side Panel">Dock ↗</button>`
+              ? `<button id="dock-btn" class="ghost-btn" title="Open in Side Panel">Side Panel ↗</button>`
               : ""
           }
-          <button id="reset-btn" class="icon-btn" title="Force reset stuck tab stream">Reset ↻</button>
+          <button id="reset-btn" class="ghost-btn" title="Reset stuck capture">Reset</button>
         </div>
       </div>
 
-      <div class="card">
-        <div class="action-row">
-          <button id="start-btn" class="btn btn-primary">Start Capture</button>
-          <button id="stop-btn" class="btn btn-danger" disabled>Stop & Transcribe</button>
-        </div>
-        <div class="status-bar">
-          <div class="status-left">
-            <span id="rec-dot" class="rec-dot" style="display:none;"></span>
-            <span id="status-text">Ready</span>
+      <div class="segmented-control">
+        <button id="nav-studio" class="seg-option active">Live Studio</button>
+        <button id="nav-history" class="seg-option">Saved (<span id="history-count">0</span>)</button>
+      </div>
+
+      <!-- VIEW 1: LIVE STUDIO -->
+      <div id="view-studio" class="view-panel">
+        <div class="surface-card">
+          <div class="transport-row">
+            <button id="start-btn" class="btn btn-primary">Start Capture</button>
+            <button id="stop-btn" class="btn btn-danger" disabled>Stop & Transcribe</button>
+            <span id="timer" class="timer-pill">00:00</span>
           </div>
-          <span id="timer" class="timer">00:00</span>
+
+          <div class="config-row">
+            <div class="param-chip">
+              <label for="preset-select">Language</label>
+              <select id="preset-select">
+                ${Object.entries(LANGUAGE_PRESETS)
+                  .map(([key, cfg]) => `<option value="${key}">${cfg.label}</option>`)
+                  .join("")}
+              </select>
+            </div>
+            <div class="param-chip">
+              <label for="task-select">Mode</label>
+              <select id="task-select">
+                <option value="transcribe">Transcribe</option>
+                <option value="translate">Translate → EN</option>
+              </select>
+            </div>
+            <div class="param-chip">
+              <label for="model-select">Engine</label>
+              <select id="model-select">
+                <option value="base">Fast (base)</option>
+                <option value="small">Accurate (small)</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="status-footer">
+            <div class="status-left">
+              <span id="rec-dot" class="rec-dot" style="display:none;"></span>
+              <span id="status-text">Ready</span>
+            </div>
+            <span id="word-badge" class="word-count">0 words</span>
+          </div>
+        </div>
+
+        <div id="error-box" class="error-box" style="display:none;"></div>
+
+        <div class="workspace-card">
+          <div class="workspace-toolbar">
+            <div class="mini-segment">
+              <button id="tab-paragraph" class="mini-seg-btn active">Paragraph</button>
+              <button id="tab-segments" class="mini-seg-btn">Timestamps</button>
+            </div>
+            <input id="search-input" class="search-input" type="text" placeholder="Search…" />
+          </div>
+
+          <div id="transcript-body" class="transcript-scroll paragraph-mode">
+            <span class="placeholder">Your transcript will appear here.</span>
+          </div>
+
+          <div class="export-row">
+            <button id="copy-btn" class="action-chip">Copy</button>
+            <button id="txt-btn" class="action-chip">Export .TXT</button>
+            <button id="srt-btn" class="action-chip">Export .SRT</button>
+          </div>
         </div>
       </div>
 
-      <div class="card">
-        <div class="options-grid">
-          <div class="field">
-            <label for="preset-select">Language / Script</label>
-            <select id="preset-select">
-              ${Object.entries(LANGUAGE_PRESETS)
-                .map(([key, cfg]) => `<option value="${key}">${cfg.label}</option>`)
-                .join("")}
-            </select>
-          </div>
-          <div class="field">
-            <label for="task-select">Mode</label>
-            <select id="task-select">
-              <option value="transcribe">Transcribe</option>
-              <option value="translate">Translate → EN</option>
-            </select>
-          </div>
-          <div class="field">
-            <label for="model-select">Model</label>
-            <select id="model-select">
-              <option value="base">Fast (base)</option>
-              <option value="small">Accurate (small)</option>
-            </select>
-          </div>
-        </div>
-      </div>
-
-      <div id="error-box" class="error-box" style="display:none;"></div>
-
-      <div class="card">
-        <div class="workspace-header">
-          <div class="tabs">
-            <button id="tab-paragraph" class="tab-btn active">Paragraph</button>
-            <button id="tab-segments" class="tab-btn">Timestamps</button>
-          </div>
-          <input id="search-input" class="search-input" type="text" placeholder="Filter text…" />
-        </div>
-        <div id="transcript-body" class="transcript-body">
-          <span class="placeholder">Your transcript will appear here.</span>
-        </div>
-        <div class="export-bar">
-          <button id="copy-btn" class="icon-btn">Copy</button>
-          <button id="txt-btn" class="icon-btn">Export .TXT</button>
-          <button id="srt-btn" class="icon-btn">Export .SRT</button>
-        </div>
-      </div>
-
-      <div class="card">
-        <div id="history-toggle" class="history-header">
-          <span>Recent Sessions (<span id="history-count">0</span>)</span>
-          <span id="history-arrow">▸</span>
-        </div>
-        <div id="history-list" class="history-list" style="display:none;"></div>
+      <!-- VIEW 2: SAVED TRANSCRIPTS -->
+      <div id="view-history" class="view-panel hidden">
+        <div id="history-list" class="history-scroll"></div>
       </div>
     </div>
   `;
 
-  // Restore saved preferences
+  document.getElementById("nav-studio").addEventListener("click", () => switchPage("studio"));
+  document.getElementById("nav-history").addEventListener("click", () => switchPage("history"));
+
   chrome.storage.local.get("transcriptoPrefs", ({ transcriptoPrefs }) => {
     if (transcriptoPrefs?.preset) {
       document.getElementById("preset-select").value = transcriptoPrefs.preset;
@@ -322,16 +340,11 @@ function initShell() {
     const srt = buildSrtContent(currentState.segments, currentState.transcript);
     downloadFile(`transcripto-${Date.now()}.srt`, srt, "application/x-subrip");
   });
-
-  document.getElementById("history-toggle").addEventListener("click", () => {
-    historyOpen = !historyOpen;
-    document.getElementById("history-list").style.display = historyOpen ? "flex" : "none";
-    document.getElementById("history-arrow").textContent = historyOpen ? "▾" : "▸";
-  });
 }
 
 function renderTranscript() {
   const container = document.getElementById("transcript-body");
+  const wordBadge = document.getElementById("word-badge");
   if (!container) return;
 
   const phase = currentState.phase || "idle";
@@ -339,21 +352,28 @@ function renderTranscript() {
   const liveText = currentState.liveText || "";
   const segments = currentState.segments || [];
 
+  const activeText = text || liveText;
+  const wordCount = activeText.trim() ? activeText.trim().split(/\s+/).length : 0;
+  if (wordBadge) wordBadge.textContent = `${wordCount} word${wordCount === 1 ? "" : "s"}`;
+
   if ((phase === "recording" || phase === "transcribing") && !text) {
+    container.classList.add("paragraph-mode");
     if (liveText) {
-      container.innerHTML = `<div style="margin-bottom:6px;"><span class="seg-time">LIVE WINDOW</span></div><div>${liveText}</div>`;
+      container.innerHTML = `<div style="margin-bottom:6px;"><span class="seg-time">LIVE</span></div><div>${liveText}</div>`;
     } else {
-      container.innerHTML = `<span class="placeholder">Listening for speech… live subtitles will appear here in ~2s.</span>`;
+      container.innerHTML = `<span class="placeholder">Listening for speech… live subtitles will appear in ~2s.</span>`;
     }
     return;
   }
 
   if (!text) {
+    container.classList.add("paragraph-mode");
     container.innerHTML = `<span class="placeholder">Your transcript will appear here.</span>`;
     return;
   }
 
   if (activeView === "segments" && segments.length > 0) {
+    container.classList.remove("paragraph-mode");
     const filtered = searchQuery
       ? segments.filter((s) => s.text.toLowerCase().includes(searchQuery))
       : segments;
@@ -365,16 +385,16 @@ function renderTranscript() {
 
     container.innerHTML = filtered
       .map(
-        (seg) => `
-        <div class="segment-row">
-          <span class="seg-time">${formatSegTime(seg.start)}</span>
-          <span>${seg.text}</span>
-        </div>`
+        (seg) =>
+          `<div class="segment-row"><span class="seg-time">${formatSegTime(
+            seg.start
+          )}</span><span class="seg-text">${seg.text}</span></div>`
       )
       .join("");
     return;
   }
 
+  container.classList.add("paragraph-mode");
   if (searchQuery && !text.toLowerCase().includes(searchQuery)) {
     container.innerHTML = `<span class="placeholder">No matching text found.</span>`;
     return;
@@ -390,34 +410,35 @@ function renderHistory() {
 
   countEl.textContent = String(historyItems.length);
   if (historyItems.length === 0) {
-    listEl.innerHTML = `<span class="placeholder" style="font-size:11px;">No saved sessions yet.</span>`;
+    listEl.innerHTML = `<div class="workspace-card" style="align-items:center;justify-content:center;"><span class="placeholder">No saved transcripts yet. Record a tab to save it here.</span></div>`;
     return;
   }
 
   listEl.innerHTML = historyItems
-    .map(
-      (item, idx) => `
-      <div class="history-item" data-idx="${idx}">
-        <div class="history-meta">
-          <span>${item.tabTitle.slice(0, 32)}</span>
-          <span>${item.language.toUpperCase()}</span>
-        </div>
-        <div class="history-snippet">${item.transcript}</div>
-      </div>`
-    )
+    .map((item, idx) => {
+      const dateStr = item.createdAt
+        ? new Date(item.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+        : "";
+      return `<div class="history-card" data-idx="${idx}"><div class="history-card-top"><span class="history-title">${
+        item.tabTitle
+      }</span><div class="history-badges"><span class="badge">${item.language.toUpperCase()}</span>${
+        dateStr ? `<span class="badge">${dateStr}</span>` : ""
+      }</div></div><div class="history-preview">${item.transcript}</div></div>`;
+    })
     .join("");
 
-  listEl.querySelectorAll(".history-item").forEach((el) => {
+  listEl.querySelectorAll(".history-card").forEach((el) => {
     el.addEventListener("click", () => {
       const item = historyItems[Number(el.dataset.idx)];
       if (!item) return;
       currentState = {
         phase: "done",
-        status: `Loaded from history · ${item.language}`,
+        status: `Loaded · ${item.tabTitle.slice(0, 26)}`,
         transcript: item.transcript,
         segments: item.segments || []
       };
       renderState();
+      switchPage("studio");
     });
   });
 }
