@@ -334,8 +334,19 @@ function renderTranscript() {
   const container = document.getElementById("transcript-body");
   if (!container) return;
 
+  const phase = currentState.phase || "idle";
   const text = currentState.transcript || "";
+  const liveText = currentState.liveText || "";
   const segments = currentState.segments || [];
+
+  if ((phase === "recording" || phase === "transcribing") && !text) {
+    if (liveText) {
+      container.innerHTML = `<div style="margin-bottom:6px;"><span class="seg-time">LIVE WINDOW</span></div><div>${liveText}</div>`;
+    } else {
+      container.innerHTML = `<span class="placeholder">Listening for speech… live subtitles will appear here in ~2s.</span>`;
+    }
+    return;
+  }
 
   if (!text) {
     container.innerHTML = `<span class="placeholder">Your transcript will appear here.</span>`;

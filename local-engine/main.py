@@ -5,6 +5,7 @@ from typing import Dict, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from faster_whisper import WhisperModel
+import numpy as np
 
 DEFAULT_MODEL = os.getenv("WHISPER_MODEL", "base")
 CPU_THREADS = int(os.getenv("WHISPER_CPU_THREADS", "4"))
@@ -117,3 +118,50 @@ async def transcribe(
                 os.remove(temp_path)
             except OSError:
                 pass
+
+
+@app.post("/transcribe-pcm")
+async def transcribe_pcm(
+    pcm: UploadFile = File(...),
+    language: Optional[str] = Form(default=None),
+    task: Optional[str] = Form(default="transcribe"),
+    model_size: Optional[str] = Form(default="base"),
+    initial_prompt: Optional[str] = Form(default=None),
+):
+    try:
+        raw_bytes = await pcm.read()
+        if not raw_bytes:
+            return {"text": "", "language": None}
+
+        # Ensure byte length aligns to 4-byte float32 samples
+        aligned_len = len(raw_bytes) - (len(raw_bytes) % 4)
+        if aligned_len == 0:
+            return {"text": "", "language": None}
+
+        audio_np = np.frombuffer(raw_bytes[:aligned_len], dtype=np.float32).copy()
+
+        model = get_or_load_model((model_size or DEFAULT_MODEL).strip().lower())
+        lang_arg = language.strip() if language and language.strip() else None
+        task_arg = "translate" if (task and task.strip().lower() == "translate") else "transcribe"
+        prompt_arg = initial_prompt.strip() if initial_prompt and initial_prompt.strip() else None
+
+        # Faster beam_size=2 for low-latency live window updates
+        segments_gen, info = model.transcribe(
+            audio_np,
+            language=lang_arg,
+            task=task_arg,
+            initial_prompt=prompt_arg,
+            beam_size=2,
+            condition_on_previous_text=False,
+            no_speech_threshold=0.65,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 400},
+        )
+
+        text_parts = [seg.text.strip() for seg in segments_gen if seg.text.strip()]
+        return {
+            "text": " ".join(text_parts),
+            "language": info.language,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc

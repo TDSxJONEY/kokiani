@@ -1,7 +1,9 @@
 import "dotenv/config";
+import http from "http";
 import express from "express";
 import cors from "cors";
 import multer from "multer";
+import { WebSocketServer } from "ws";
 
 const app = express();
 const upload = multer({
@@ -10,6 +12,9 @@ const upload = multer({
 });
 
 const LOCAL_ENGINE_URL = process.env.LOCAL_ENGINE_URL || "http://127.0.0.1:8000";
+const SAMPLE_RATE = 16000;
+const WINDOW_SECONDS = 6;
+const MAX_WINDOW_BYTES = SAMPLE_RATE * WINDOW_SECONDS * 4; // 4 bytes per Float32 sample
 
 app.use(cors({ origin: true }));
 
@@ -74,8 +79,90 @@ app.post("/api/transcribe", upload.single("audio"), async (req, res) => {
   }
 });
 
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: "/ws/stream" });
+
+wss.on("connection", (ws) => {
+  let sessionOptions = {
+    language: "",
+    task: "transcribe",
+    model_size: "base",
+    initial_prompt: ""
+  };
+  let rollingBuffer = Buffer.alloc(0);
+  let hasNewAudio = false;
+  let isProcessing = false;
+
+  const tickInterval = setInterval(async () => {
+    if (isProcessing || !hasNewAudio || rollingBuffer.length < SAMPLE_RATE * 1 * 4) {
+      return;
+    }
+
+    isProcessing = true;
+    hasNewAudio = false;
+    const snapshot = Buffer.from(rollingBuffer);
+
+    try {
+      const formData = new FormData();
+      formData.append("pcm", new Blob([snapshot], { type: "application/octet-stream" }), "window.pcm");
+      if (sessionOptions.language) formData.append("language", sessionOptions.language);
+      if (sessionOptions.task) formData.append("task", sessionOptions.task);
+      if (sessionOptions.model_size) formData.append("model_size", sessionOptions.model_size);
+      if (sessionOptions.initial_prompt) {
+        formData.append("initial_prompt", sessionOptions.initial_prompt);
+      }
+
+      const res = await fetch(`${LOCAL_ENGINE_URL}/transcribe-pcm`, {
+        method: "POST",
+        body: formData
+      });
+      if (res.ok && ws.readyState === ws.OPEN) {
+        const data = await res.json();
+        ws.send(
+          JSON.stringify({
+            type: "partial",
+            text: data.text || "",
+            language: data.language || null
+          })
+        );
+      }
+    } catch (err) {
+      console.error("Live stream window error:", err);
+    } finally {
+      isProcessing = false;
+    }
+  }, 1800);
+
+  ws.on("message", (data, isBinary) => {
+    if (!isBinary) {
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.type === "config") {
+          sessionOptions = { ...sessionOptions, ...(msg.options || {}) };
+          rollingBuffer = Buffer.alloc(0);
+        }
+      } catch {
+        // ignore malformed control message
+      }
+      return;
+    }
+
+    const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data);
+    rollingBuffer = Buffer.concat([rollingBuffer, chunk]);
+    if (rollingBuffer.length > MAX_WINDOW_BYTES) {
+      rollingBuffer = rollingBuffer.subarray(rollingBuffer.length - MAX_WINDOW_BYTES);
+    }
+    hasNewAudio = true;
+  });
+
+  ws.on("close", () => {
+    clearInterval(tickInterval);
+    rollingBuffer = Buffer.alloc(0);
+  });
+});
+
 const port = Number(process.env.PORT || 8787);
-app.listen(port, () => {
-  console.log(`Transcripto API listening on http://localhost:${port}`);
+server.listen(port, () => {
+  console.log(`Transcripto API + WebSocket listening on http://localhost:${port}`);
   console.log(`Routing transcription to ${LOCAL_ENGINE_URL}`);
 });

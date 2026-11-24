@@ -1,8 +1,11 @@
 let recorder = null;
 let capturedStream = null;
 let audioContext = null;
+let processorNode = null;
+let streamSocket = null;
 let chunks = [];
 let activeOptions = {};
+let latestLiveText = "";
 
 async function setState(state) {
   await chrome.runtime.sendMessage({
@@ -10,6 +13,75 @@ async function setState(state) {
     type: "SET_STATE",
     state
   });
+}
+
+function downsampleTo16k(float32Buffer, inputSampleRate) {
+  if (inputSampleRate === 16000) return float32Buffer;
+  const ratio = inputSampleRate / 16000;
+  const newLength = Math.round(float32Buffer.length / ratio);
+  const result = new Float32Array(newLength);
+  let offsetResult = 0;
+  let offsetBuffer = 0;
+
+  while (offsetResult < result.length) {
+    const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
+    let accum = 0;
+    let count = 0;
+    for (let i = offsetBuffer; i < nextOffsetBuffer && i < float32Buffer.length; i++) {
+      accum += float32Buffer[i];
+      count++;
+    }
+    result[offsetResult] = count > 0 ? accum / count : 0;
+    offsetResult++;
+    offsetBuffer = nextOffsetBuffer;
+  }
+  return result;
+}
+
+function connectLiveSocket(options, startedAt) {
+  try {
+    streamSocket = new WebSocket("ws://localhost:8787/ws/stream");
+    streamSocket.binaryType = "arraybuffer";
+
+    streamSocket.onopen = () => {
+      streamSocket.send(JSON.stringify({ type: "config", options }));
+    };
+
+    streamSocket.onmessage = async (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.type === "partial" && msg.text && recorder?.state === "recording") {
+          latestLiveText = msg.text;
+          await setState({
+            phase: "recording",
+            status: `Live transcribing${msg.language ? ` · ${msg.language}` : ""}…`,
+            startedAt,
+            tabTitle: options.tabTitle,
+            liveText: latestLiveText
+          });
+        }
+      } catch {
+        // ignore parse errors
+      }
+    };
+  } catch {
+    streamSocket = null;
+  }
+}
+
+function cleanupStreamResources() {
+  if (processorNode) {
+    try {
+      processorNode.disconnect();
+    } catch {}
+    processorNode = null;
+  }
+  if (streamSocket) {
+    try {
+      streamSocket.close();
+    } catch {}
+    streamSocket = null;
+  }
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -21,6 +93,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         if (recorder?.state === "recording") throw new Error("A capture is already running.");
 
         activeOptions = message.options || {};
+        latestLiveText = "";
+        const startedAt = Date.now();
 
         capturedStream = await navigator.mediaDevices.getUserMedia({
           audio: {
@@ -32,10 +106,23 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           video: false
         });
 
-        // Keep normal tab playback audible while capturing
         audioContext = new AudioContext();
         const source = audioContext.createMediaStreamSource(capturedStream);
+        // Keep normal tab playback audible
         source.connect(audioContext.destination);
+
+        // Tap audio stream for live 16 kHz PCM frames
+        connectLiveSocket(activeOptions, startedAt);
+        processorNode = audioContext.createScriptProcessor(4096, 1, 1);
+        processorNode.onaudioprocess = (event) => {
+          if (streamSocket?.readyState === WebSocket.OPEN) {
+            const inputData = event.inputBuffer.getChannelData(0);
+            const pcm16k = downsampleTo16k(inputData, audioContext.sampleRate);
+            streamSocket.send(pcm16k.buffer);
+          }
+        };
+        source.connect(processorNode);
+        processorNode.connect(audioContext.destination);
 
         chunks = [];
         const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
@@ -48,11 +135,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         };
 
         recorder.onstop = async () => {
+          cleanupStreamResources();
           try {
             await setState({
               phase: "transcribing",
-              status: `Transcribing (${activeOptions.model_size || "base"})…`,
-              tabTitle: activeOptions.tabTitle
+              status: `Finalizing transcript (${activeOptions.model_size || "base"})…`,
+              tabTitle: activeOptions.tabTitle,
+              liveText: latestLiveText
             });
 
             const audioBlob = new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
@@ -76,11 +165,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             await setState({
               phase: "done",
               status: `Completed · ${result.language || "auto"} (${activeOptions.model_size || "base"})`,
-              transcript: result.text || "(No speech detected.)",
+              transcript: result.text || latestLiveText || "(No speech detected.)",
               segments: result.segments || [],
               language: result.language || null,
               task: activeOptions.task || "transcribe",
-              tabTitle: activeOptions.tabTitle
+              tabTitle: activeOptions.tabTitle,
+              liveText: ""
             });
           } catch (error) {
             await setState({
@@ -101,9 +191,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         recorder.start();
         await setState({
           phase: "recording",
-          status: "Recording tab audio…",
-          startedAt: Date.now(),
-          tabTitle: activeOptions.tabTitle
+          status: "Recording & streaming live…",
+          startedAt,
+          tabTitle: activeOptions.tabTitle,
+          liveText: ""
         });
         sendResponse({ ok: true });
         return;
@@ -118,6 +209,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         sendResponse({ ok: true });
       }
     } catch (error) {
+      cleanupStreamResources();
       const messageText = error instanceof Error ? error.message : String(error);
       await setState({ phase: "error", status: "Capture error", error: messageText });
       sendResponse({ ok: false, error: messageText });
