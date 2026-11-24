@@ -130,8 +130,8 @@ function initShell() {
     <div class="app-shell">
       <div class="topbar">
         <div class="brand-group">
-          <div class="app-icon">T</div>
-          <span class="brand-title">Transcripto</span>
+          <div class="app-icon">K</div>
+          <span class="brand-title">Kokiani</span>
           <span id="health-pill" class="health-pill"><span class="dot"></span>Checking</span>
         </div>
         <div class="nav-actions">
@@ -332,13 +332,13 @@ function initShell() {
 
   document.getElementById("txt-btn").addEventListener("click", () => {
     if (!currentState.transcript) return;
-    downloadFile(`transcripto-${Date.now()}.txt`, currentState.transcript, "text/plain");
+    downloadFile(`kokiani-${Date.now()}.txt`, currentState.transcript, "text/plain");
   });
 
   document.getElementById("srt-btn").addEventListener("click", () => {
     if (!currentState.transcript) return;
     const srt = buildSrtContent(currentState.segments, currentState.transcript);
-    downloadFile(`transcripto-${Date.now()}.srt`, srt, "application/x-subrip");
+    downloadFile(`kokiani-${Date.now()}.srt`, srt, "application/x-subrip");
   });
 }
 

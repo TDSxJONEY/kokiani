@@ -35,14 +35,14 @@ async def lifespan(app: FastAPI):
     ml_models.clear()
 
 
-app = FastAPI(title="Transcripto Local Engine", lifespan=lifespan)
+app = FastAPI(title="Kokiani Local Engine", lifespan=lifespan)
 
 
 @app.get("/health")
 def health():
     return {
         "ok": True,
-        "service": "transcripto-local-engine",
+        "service": "kokiani-local-engine",
         "loaded_models": list(ml_models.keys()),
         "compute_type": "int8",
         "cpu_threads": CPU_THREADS,

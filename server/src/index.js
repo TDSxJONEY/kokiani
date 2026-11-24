@@ -26,13 +26,13 @@ app.get("/health", async (_req, res) => {
     const engineData = engineRes.ok ? await engineRes.json() : null;
     res.json({
       ok: Boolean(engineData?.ok),
-      service: "transcripto-api",
+      service: "kokiani-api",
       localEngine: engineData || { ok: false }
     });
   } catch {
     res.status(503).json({
       ok: false,
-      service: "transcripto-api",
+      service: "kokiani-api",
       localEngine: { ok: false, error: "Local engine unreachable" }
     });
   }
@@ -264,6 +264,6 @@ wss.on("connection", (ws) => {
 
 const port = Number(process.env.PORT || 8787);
 server.listen(port, () => {
-  console.log(`Transcripto API + Progressive WebSocket listening on http://localhost:${port}`);
+  console.log(`Kokiani API + Progressive WebSocket listening on http://localhost:${port}`);
   console.log(`Routing transcription to ${LOCAL_ENGINE_URL}`);
 });

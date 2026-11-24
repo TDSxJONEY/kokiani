@@ -1,67 +1,131 @@
-# Transcripto MVP
 
-A Chrome Manifest V3 extension that captures audio from the current tab and sends the recording to a Node.js API for multilingual transcription.
+# Kokiani
 
-## Current MVP scope
+**Kokiani** is an open-source, zero-cost, 100% local-first Chrome Manifest V3 extension and real-time audio transcription engine. It captures digital audio directly from any active browser tab—even when your system speakers are muted—and streams it over WebSockets to a local Faster-Whisper inference backend with zero cloud dependencies or API keys.
 
-- User-initiated tab audio capture
-- Keeps tab audio audible while capturing
-- Records the full session
-- Uploads WebM audio to the backend
-- Uses OpenAI `gpt-transcribe` with automatic language detection
-- Displays the completed transcript in the extension popup
+---
 
-This is the first end-to-end slice. Near-live transcription, local Faster-Whisper inference, provider switching, timestamps, and export are the next milestones.
+## Key Features
+
+- **100% Local & Private Inference:** Powered by CTranslate2-accelerated `faster-whisper` (`INT8` quantized) running locally via Python FastAPI. No API keys, usage limits, or external audio uploads.
+- **Real-Time Progressive Live Captions:** Streams 16 kHz mono `Float32` PCM chunks over WebSockets (`ws://localhost:8787/ws/stream`) with a commit + tentative sliding window engine that locks completed phrases into an accumulating transcript while refining trailing speech in real time.
+- **Silent Background Capture:** Captures audio directly from Chrome's tab rendering pipeline (`chrome.tabCapture` + Offscreen Document), allowing you to mute your OS volume (`0%`) while transcribing lectures, meetings, or videos at full digital fidelity.
+- **Dual-Surface Apple-Inspired UI:** Works as both a compact toolbar popup and a docked **Chrome Side Panel** (`chrome.sidePanel`) that stays open alongside active tabs.
+- **Multilingual & Code-Switching Support:** Supports on-the-fly switching between **Fast (`base`)** and **Accurate (`small`)** models, **Transcribe** and **Translate → EN** modes, Silero VAD filtering, and script-guided presets (`Auto-Detect`, `Hindi Devanagari`, `Hinglish Mixed`, `English`, and `Bengali`).
+- **Interactive Transcript Workspace:** Includes a live elapsed timer, word count, keyword search filter, **Paragraph** vs. **Timestamped Segment** views, local session history, clipboard copy, and `.TXT` / `.SRT` subtitle exports.
+
+---
+
+## Architecture
+
+```text
+┌──────────────────────────────────────────────────────────────────┐
+│ Chrome Extension (Manifest V3)                                   │
+│  ├─ Popup / Side Panel UI (Apple-inspired dark workspace)        │
+│  ├─ Background Service Worker (session state & tabCapture)       │
+│  └─ Offscreen Document (16 kHz mono PCM resampling + WebSocket)  │
+└────────────────────────────────┬─────────────────────────────────┘
+                                 │ ws://localhost:8787/ws/stream
+                                 ▼
+┌──────────────────────────────────────────────────────────────────┐
+│ Node.js / Express Gateway (Port 8787)                            │
+│  ├─ Single-lane backpressure queue & sliding PCM buffer          │
+│  ├─ Commit + tentative segment merging & force-commit guard      │
+│  └─ REST fallback (/api/transcribe) & health proxy (/health)     │
+└────────────────────────────────┬─────────────────────────────────┘
+                                 │ http://127.0.0.1:8000/transcribe-pcm
+                                 ▼
+┌──────────────────────────────────────────────────────────────────┐
+│ Python FastAPI Local Engine (Port 8000)                          │
+│  └─ Faster-Whisper (CTranslate2 INT8, Silero VAD, zero-disk NumPy)│
+└──────────────────────────────────────────────────────────────────┘
+```
+
+---
 
 ## Requirements
 
-- Node.js 20+
-- Google Chrome
-- An OpenAI API key for cloud transcription
+- **Node.js** 20+
+- **Python** 3.9+
+- **Google Chrome** (Manifest V3 with Side Panel support)
+- Multi-core CPU (tested on Intel Core i5-11320H, 16 GB RAM, Windows 11)
 
-## 1. Start the backend (PowerShell)
+---
+
+## Quick Start
+
+### 1. Start the Local Whisper Engine (Python)
+
+Open PowerShell:
+
+```powershell
+cd local-engine
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+uvicorn main:app --host 127.0.0.1 --port 8000
+```
+
+*On the first run, Faster-Whisper automatically downloads the `base` model weights and caches them locally.*
+
+### 2. Start the Node.js API & WebSocket Gateway
+
+Open a second terminal:
 
 ```powershell
 cd server
-Copy-Item .env.example .env
-# Edit .env and add your OPENAI_API_KEY
 npm install
 npm run dev
 ```
 
-Check `http://localhost:8787/health`.
+Verify that the services are healthy at:
 
-## 2. Load the extension
+```text
+http://localhost:8787/health
+```
 
-1. Open `chrome://extensions`.
-2. Enable **Developer mode**.
-3. Choose **Load unpacked**.
-4. Select this project's `extension` folder.
-5. Pin Transcripto to the Chrome toolbar.
+### 3. Load the Extension in Chrome
 
-## 3. Test
+1. Open `chrome://extensions` in Chrome.
+2. Enable **Developer mode** (top-right toggle).
+3. Click **Load unpacked** and select this repository's `extension` folder.
+4. Pin **Kokiani** to your Chrome toolbar.
 
-1. Open a video or audio page in a tab.
-2. Start playing the video.
-3. Click the Transcripto extension icon.
-4. Click **Start capture**.
-5. Let it record for at least a few seconds.
-6. Open the extension popup again and click **Stop & transcribe**.
-7. Wait for the transcript to appear.
+---
 
-## Notes and limitations
+## Usage
 
-- This first slice transcribes after you stop recording; it is not yet live.
-- The backend currently uses cloud transcription. Keep the API key only on the backend, never in extension files.
-- The upload is capped at 25 MB in this MVP. Long recordings need chunked upload/segmented processing.
-- Capture is initiated only after an explicit user action.
-- `tabCapture` can interrupt normal tab audio output unless the captured stream is routed back to an audio destination; this MVP does that.
-- Do not capture or upload audio unless you have the right to do so and have informed relevant participants where appropriate.
+1. Open any tab playing audio or video (YouTube, lectures, podcasts, or browser meetings).
+2. Click the **Kokiani** icon in the toolbar (or click **Side Panel ↗** to dock it alongside your tab).
+3. Choose your **Language** preset, **Mode** (`Transcribe` or `Translate → EN`), and **Engine** (`Fast (base)` or `Accurate (small)`).
+4. Click **Start Capture** to watch live progressive captions stream in real time.
+5. Click **Stop & Transcribe** to finalize the trailing segment, inspect timestamps, search text, or export as `.TXT` / `.SRT`.
 
-## Next milestones
+---
 
-1. Add segmented near-live transcription and transcript reconciliation.
-2. Add a provider interface and local Faster-Whisper service.
-3. Add a hybrid provider router with explicit user preference and fallback.
-4. Add transcript timestamps, TXT/SRT export, and persistent session history.
-5. Add React/Vite UI and automated tests.
+## Privacy & Responsible Use
+
+- All audio capture, PCM resampling, and speech-to-text inference run exclusively on your local machine (`127.0.0.1`).
+- Capture begins only after an explicit user click on **Start Capture**.
+- Ensure you have permission to record or transcribe audio and notify participants where required by law.
+
+---
+
+## Tech Stack
+
+| Component | Technology |
+|---|---|
+| Browser Extension | Chrome Manifest V3, JavaScript |
+| Audio Capture | `chrome.tabCapture`, Offscreen Document, Web Audio API |
+| Streaming | WebSockets, PCM Float32 |
+| Backend Gateway | Node.js, Express |
+| Local Inference API | Python, FastAPI |
+| Speech Recognition | Faster-Whisper, CTranslate2 |
+| Audio Processing | NumPy, Silero VAD |
+| Storage | `chrome.storage.local` |
+
+---
+
+## License
+
+This project is open source. See the [LICENSE](LICENSE) file for details.

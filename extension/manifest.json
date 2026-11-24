@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Transcripto",
-  "version": "0.2.0",
-  "description": "Local AI audio capture and multilingual transcription for browser tabs.",
+  "name": "Kokiani",
+  "version": "1.0.0",
+  "description": "Local-first real-time browser tab audio capture and multilingual transcription.",
   "permissions": [
     "tabCapture",
     "offscreen",
@@ -16,7 +16,7 @@
   ],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Transcripto"
+    "default_title": "Kokiani"
   },
   "side_panel": {
     "default_path": "sidepanel.html"
