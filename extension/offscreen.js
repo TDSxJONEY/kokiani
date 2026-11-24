@@ -1,7 +1,7 @@
 let recorder = null;
 let capturedStream = null;
 let audioContext = null;
-let processorNode = null;
+let workletNode = null;
 let streamSocket = null;
 let chunks = [];
 let activeOptions = {};
@@ -14,29 +14,6 @@ async function setState(state) {
     type: "SET_STATE",
     state
   });
-}
-
-function downsampleTo16k(float32Buffer, inputSampleRate) {
-  if (inputSampleRate === 16000) return float32Buffer;
-  const ratio = inputSampleRate / 16000;
-  const newLength = Math.round(float32Buffer.length / ratio);
-  const result = new Float32Array(newLength);
-  let offsetResult = 0;
-  let offsetBuffer = 0;
-
-  while (offsetResult < result.length) {
-    const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
-    let accum = 0;
-    let count = 0;
-    for (let i = offsetBuffer; i < nextOffsetBuffer && i < float32Buffer.length; i++) {
-      accum += float32Buffer[i];
-      count++;
-    }
-    result[offsetResult] = count > 0 ? accum / count : 0;
-    offsetResult++;
-    offsetBuffer = nextOffsetBuffer;
-  }
-  return result;
 }
 
 function connectLiveSocket(options, startedAt) {
@@ -101,11 +78,12 @@ function requestSocketFinalization() {
 }
 
 function cleanupStreamResources() {
-  if (processorNode) {
+  if (workletNode) {
     try {
-      processorNode.disconnect();
+      workletNode.port.onmessage = null;
+      workletNode.disconnect();
     } catch {}
-    processorNode = null;
+    workletNode = null;
   }
   if (streamSocket) {
     try {
@@ -142,16 +120,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         source.connect(audioContext.destination);
 
         connectLiveSocket(activeOptions, startedAt);
-        processorNode = audioContext.createScriptProcessor(4096, 1, 1);
-        processorNode.onaudioprocess = (event) => {
-          if (streamSocket?.readyState === WebSocket.OPEN) {
-            const inputData = event.inputBuffer.getChannelData(0);
-            const pcm16k = downsampleTo16k(inputData, audioContext.sampleRate);
-            streamSocket.send(pcm16k.buffer);
+        await audioContext.audioWorklet.addModule(chrome.runtime.getURL("pcm-worklet.js"));
+        workletNode = new AudioWorkletNode(audioContext, "pcm-16k-processor");
+        workletNode.port.onmessage = (event) => {
+          if (streamSocket?.readyState === WebSocket.OPEN && event.data) {
+            streamSocket.send(event.data);
           }
         };
-        source.connect(processorNode);
-        processorNode.connect(audioContext.destination);
+        source.connect(workletNode);
 
         chunks = [];
         const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
@@ -164,11 +140,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         };
 
         recorder.onstop = async () => {
-          if (processorNode) {
+          if (workletNode) {
             try {
-              processorNode.disconnect();
+              workletNode.port.onmessage = null;
+              workletNode.disconnect();
             } catch {}
-            processorNode = null;
+            workletNode = null;
           }
 
           try {

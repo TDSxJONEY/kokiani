@@ -14,8 +14,9 @@ const upload = multer({
 const LOCAL_ENGINE_URL = process.env.LOCAL_ENGINE_URL || "http://127.0.0.1:8000";
 const SAMPLE_RATE = 16000;
 const BYTES_PER_SEC = SAMPLE_RATE * 4; // Float32 mono
-const MAX_WINDOW_BYTES = BYTES_PER_SEC * 10; // Safety cap: 10s uncommitted buffer
-const COMMIT_LAG_SEC = 2.2; // Lock segments ending >2.2s behind live edge
+const MAX_WINDOW_BYTES = BYTES_PER_SEC * 25; // Generous 25s cap so fast speech is never dropped
+const COMMIT_LAG_SEC = 1.8; // Lock segments ending >1.8s behind live edge
+const FORCE_COMMIT_WINDOW_SEC = 6.5; // Force-commit continuous speech if no pause occurs within 6.5s
 
 app.use(cors({ origin: true }));
 
@@ -123,7 +124,6 @@ wss.on("connection", (ws) => {
     if (sessionOptions.task) formData.append("task", sessionOptions.task);
     if (sessionOptions.model_size) formData.append("model_size", sessionOptions.model_size);
 
-    // Prime Whisper with the tail of already-committed text for continuity
     const recentContext = committedSegments
       .slice(-2)
       .map((s) => s.text)
@@ -149,11 +149,20 @@ wss.on("connection", (ws) => {
     const tentativeParts = [];
     let advanceSec = 0;
 
-    for (const seg of segments) {
+    // If speaker talks continuously for >= 6.5s without a pause, relax commit lag to 0.6s
+    const effectiveLag = snapshotDurationSec >= FORCE_COMMIT_WINDOW_SEC ? 0.6 : COMMIT_LAG_SEC;
+
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i];
       const absStart = Number((snapshotStartSec + seg.start).toFixed(2));
       const absEnd = Number((snapshotStartSec + seg.end).toFixed(2));
+      const isTrailingUnfinished =
+        !isFinal &&
+        i === segments.length - 1 &&
+        snapshotDurationSec - seg.end < effectiveLag &&
+        snapshotDurationSec < FORCE_COMMIT_WINDOW_SEC;
 
-      if (isFinal || snapshotDurationSec - seg.end >= COMMIT_LAG_SEC) {
+      if (!isTrailingUnfinished) {
         committedSegments.push({
           start: absStart,
           end: absEnd,
@@ -167,7 +176,7 @@ wss.on("connection", (ws) => {
       }
     }
 
-    // Trim already-committed audio from the front of uncommittedBuffer
+    // Trim only up to the exact audio that was actually committed
     if (advanceSec > 0) {
       const trimBytes = Math.min(
         uncommittedBuffer.length,
@@ -219,7 +228,6 @@ wss.on("connection", (ws) => {
           detectedLanguage = null;
         } else if (msg.type === "finalize") {
           clearInterval(tickInterval);
-          // Wait briefly if an inference tick is mid-flight
           while (isProcessing) {
             await new Promise((r) => setTimeout(r, 80));
           }
@@ -239,7 +247,6 @@ wss.on("connection", (ws) => {
     const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data);
     uncommittedBuffer = Buffer.concat([uncommittedBuffer, chunk]);
 
-    // Safety cap if Whisper falls far behind on slow hardware
     if (uncommittedBuffer.length > MAX_WINDOW_BYTES) {
       const overflow = uncommittedBuffer.length - MAX_WINDOW_BYTES;
       const alignedOverflow = overflow - (overflow % 4);
