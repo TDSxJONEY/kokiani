@@ -5,7 +5,8 @@ let processorNode = null;
 let streamSocket = null;
 let chunks = [];
 let activeOptions = {};
-let latestLiveText = "";
+let latestLive = { committedText: "", tentativeText: "", segments: [], language: null };
+let finalizeResolver = null;
 
 async function setState(state) {
   await chrome.runtime.sendMessage({
@@ -50,15 +51,26 @@ function connectLiveSocket(options, startedAt) {
     streamSocket.onmessage = async (event) => {
       try {
         const msg = JSON.parse(event.data);
-        if (msg.type === "partial" && msg.text && recorder?.state === "recording") {
-          latestLiveText = msg.text;
+        if (msg.type === "progress" && recorder?.state === "recording") {
+          latestLive = {
+            committedText: msg.committedText || "",
+            tentativeText: msg.tentativeText || "",
+            segments: msg.segments || [],
+            language: msg.language || null
+          };
           await setState({
             phase: "recording",
-            status: `Live transcribing${msg.language ? ` · ${msg.language}` : ""}…`,
+            status: `Live${msg.language ? ` · ${msg.language}` : ""} (${options.model_size || "base"})`,
             startedAt,
             tabTitle: options.tabTitle,
-            liveText: latestLiveText
+            committedText: latestLive.committedText,
+            tentativeText: latestLive.tentativeText,
+            segments: latestLive.segments
           });
+        } else if (msg.type === "final" && finalizeResolver) {
+          const resolve = finalizeResolver;
+          finalizeResolver = null;
+          resolve(msg);
         }
       } catch {
         // ignore parse errors
@@ -67,6 +79,25 @@ function connectLiveSocket(options, startedAt) {
   } catch {
     streamSocket = null;
   }
+}
+
+function requestSocketFinalization() {
+  return new Promise((resolve) => {
+    if (!streamSocket || streamSocket.readyState !== WebSocket.OPEN) {
+      resolve(null);
+      return;
+    }
+    const timeout = setTimeout(() => {
+      finalizeResolver = null;
+      resolve(null);
+    }, 12000);
+
+    finalizeResolver = (msg) => {
+      clearTimeout(timeout);
+      resolve(msg);
+    };
+    streamSocket.send(JSON.stringify({ type: "finalize" }));
+  });
 }
 
 function cleanupStreamResources() {
@@ -93,7 +124,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         if (recorder?.state === "recording") throw new Error("A capture is already running.");
 
         activeOptions = message.options || {};
-        latestLiveText = "";
+        latestLive = { committedText: "", tentativeText: "", segments: [], language: null };
         const startedAt = Date.now();
 
         capturedStream = await navigator.mediaDevices.getUserMedia({
@@ -108,10 +139,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
         audioContext = new AudioContext();
         const source = audioContext.createMediaStreamSource(capturedStream);
-        // Keep normal tab playback audible
         source.connect(audioContext.destination);
 
-        // Tap audio stream for live 16 kHz PCM frames
         connectLiveSocket(activeOptions, startedAt);
         processorNode = audioContext.createScriptProcessor(4096, 1, 1);
         processorNode.onaudioprocess = (event) => {
@@ -135,19 +164,47 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         };
 
         recorder.onstop = async () => {
-          cleanupStreamResources();
+          if (processorNode) {
+            try {
+              processorNode.disconnect();
+            } catch {}
+            processorNode = null;
+          }
+
           try {
             await setState({
               phase: "transcribing",
-              status: `Finalizing transcript (${activeOptions.model_size || "base"})…`,
+              status: "Finalizing tail segment…",
               tabTitle: activeOptions.tabTitle,
-              liveText: latestLiveText
+              committedText: latestLive.committedText,
+              tentativeText: latestLive.tentativeText,
+              segments: latestLive.segments
             });
 
+            // Fast path: finalize the remaining ~2s tail via WebSocket
+            const wsFinal = await requestSocketFinalization();
+            if (wsFinal && (wsFinal.text || latestLive.committedText)) {
+              const finalText = wsFinal.text || latestLive.committedText;
+              await setState({
+                phase: "done",
+                status: `Completed · ${wsFinal.language || latestLive.language || "auto"} (${
+                  activeOptions.model_size || "base"
+                })`,
+                transcript: finalText,
+                segments: wsFinal.segments || latestLive.segments || [],
+                language: wsFinal.language || latestLive.language || null,
+                task: activeOptions.task || "transcribe",
+                tabTitle: activeOptions.tabTitle,
+                committedText: "",
+                tentativeText: ""
+              });
+              return;
+            }
+
+            // Fallback path if WebSocket was unavailable
             const audioBlob = new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
             const formData = new FormData();
             formData.append("audio", audioBlob, "browser-audio.webm");
-
             if (activeOptions.language) formData.append("language", activeOptions.language);
             if (activeOptions.task) formData.append("task", activeOptions.task);
             if (activeOptions.model_size) formData.append("model_size", activeOptions.model_size);
@@ -165,12 +222,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             await setState({
               phase: "done",
               status: `Completed · ${result.language || "auto"} (${activeOptions.model_size || "base"})`,
-              transcript: result.text || latestLiveText || "(No speech detected.)",
+              transcript: result.text || "(No speech detected.)",
               segments: result.segments || [],
               language: result.language || null,
               task: activeOptions.task || "transcribe",
               tabTitle: activeOptions.tabTitle,
-              liveText: ""
+              committedText: "",
+              tentativeText: ""
             });
           } catch (error) {
             await setState({
@@ -179,6 +237,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
               error: error instanceof Error ? error.message : String(error)
             });
           } finally {
+            cleanupStreamResources();
             capturedStream?.getTracks().forEach((track) => track.stop());
             capturedStream = null;
             await audioContext?.close();
@@ -194,7 +253,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           status: "Recording & streaming live…",
           startedAt,
           tabTitle: activeOptions.tabTitle,
-          liveText: ""
+          committedText: "",
+          tentativeText: "",
+          segments: []
         });
         sendResponse({ ok: true });
         return;

@@ -349,19 +349,52 @@ function renderTranscript() {
 
   const phase = currentState.phase || "idle";
   const text = currentState.transcript || "";
-  const liveText = currentState.liveText || "";
+  const committedText = currentState.committedText || "";
+  const tentativeText = currentState.tentativeText || "";
   const segments = currentState.segments || [];
 
-  const activeText = text || liveText;
+  const combinedLive = [committedText, tentativeText].filter(Boolean).join(" ");
+  const activeText = text || combinedLive;
   const wordCount = activeText.trim() ? activeText.trim().split(/\s+/).length : 0;
   if (wordBadge) wordBadge.textContent = `${wordCount} word${wordCount === 1 ? "" : "s"}`;
 
   if ((phase === "recording" || phase === "transcribing") && !text) {
+    if (activeView === "segments" && segments.length > 0) {
+      container.classList.remove("paragraph-mode");
+      container.innerHTML =
+        segments
+          .map(
+            (seg) =>
+              `<div class="segment-row"><span class="seg-time">${formatSegTime(
+                seg.start
+              )}</span><span class="seg-text">${seg.text}</span></div>`
+          )
+          .join("") +
+        (tentativeText
+          ? `<div class="segment-row"><span class="seg-time">LIVE</span><span class="seg-text" style="color:var(--text-secondary);font-style:italic;">${tentativeText}</span></div>`
+          : "");
+      container.scrollTop = container.scrollHeight;
+      return;
+    }
+
     container.classList.add("paragraph-mode");
-    if (liveText) {
-      container.innerHTML = `<div style="margin-bottom:6px;"><span class="seg-time">LIVE</span></div><div>${liveText}</div>`;
+    if (combinedLive) {
+      container.innerHTML = "";
+      if (committedText) {
+        const committedSpan = document.createElement("span");
+        committedSpan.textContent = committedText + (tentativeText ? " " : "");
+        container.appendChild(committedSpan);
+      }
+      if (tentativeText) {
+        const tentativeSpan = document.createElement("span");
+        tentativeSpan.style.color = "var(--text-secondary)";
+        tentativeSpan.style.fontStyle = "italic";
+        tentativeSpan.textContent = tentativeText;
+        container.appendChild(tentativeSpan);
+      }
+      container.scrollTop = container.scrollHeight;
     } else {
-      container.innerHTML = `<span class="placeholder">Listening for speech… live subtitles will appear in ~2s.</span>`;
+      container.innerHTML = `<span class="placeholder">Listening for speech… live captions will appear here in ~2s.</span>`;
     }
     return;
   }

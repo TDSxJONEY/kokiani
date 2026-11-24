@@ -13,8 +13,9 @@ const upload = multer({
 
 const LOCAL_ENGINE_URL = process.env.LOCAL_ENGINE_URL || "http://127.0.0.1:8000";
 const SAMPLE_RATE = 16000;
-const WINDOW_SECONDS = 6;
-const MAX_WINDOW_BYTES = SAMPLE_RATE * WINDOW_SECONDS * 4; // 4 bytes per Float32 sample
+const BYTES_PER_SEC = SAMPLE_RATE * 4; // Float32 mono
+const MAX_WINDOW_BYTES = BYTES_PER_SEC * 10; // Safety cap: 10s uncommitted buffer
+const COMMIT_LAG_SEC = 2.2; // Lock segments ending >2.2s behind live edge
 
 app.use(cors({ origin: true }));
 
@@ -89,80 +90,173 @@ wss.on("connection", (ws) => {
     model_size: "base",
     initial_prompt: ""
   };
-  let rollingBuffer = Buffer.alloc(0);
+
+  let uncommittedBuffer = Buffer.alloc(0);
+  let bufferStartSec = 0;
+  let committedSegments = [];
+  let detectedLanguage = null;
   let hasNewAudio = false;
   let isProcessing = false;
 
-  const tickInterval = setInterval(async () => {
-    if (isProcessing || !hasNewAudio || rollingBuffer.length < SAMPLE_RATE * 1 * 4) {
-      return;
-    }
-
-    isProcessing = true;
-    hasNewAudio = false;
-    const snapshot = Buffer.from(rollingBuffer);
-
-    try {
-      const formData = new FormData();
-      formData.append("pcm", new Blob([snapshot], { type: "application/octet-stream" }), "window.pcm");
-      if (sessionOptions.language) formData.append("language", sessionOptions.language);
-      if (sessionOptions.task) formData.append("task", sessionOptions.task);
-      if (sessionOptions.model_size) formData.append("model_size", sessionOptions.model_size);
-      if (sessionOptions.initial_prompt) {
-        formData.append("initial_prompt", sessionOptions.initial_prompt);
-      }
-
-      const res = await fetch(`${LOCAL_ENGINE_URL}/transcribe-pcm`, {
-        method: "POST",
-        body: formData
-      });
-      if (res.ok && ws.readyState === ws.OPEN) {
-        const data = await res.json();
+  async function processWindow(isFinal = false) {
+    if (uncommittedBuffer.length < SAMPLE_RATE * 0.4 * 4) {
+      if (isFinal && ws.readyState === ws.OPEN) {
         ws.send(
           JSON.stringify({
-            type: "partial",
-            text: data.text || "",
-            language: data.language || null
+            type: "final",
+            text: committedSegments.map((s) => s.text).join(" "),
+            segments: committedSegments,
+            language: detectedLanguage
           })
         );
       }
+      return;
+    }
+
+    const snapshot = Buffer.from(uncommittedBuffer);
+    const snapshotStartSec = bufferStartSec;
+    const snapshotDurationSec = snapshot.length / BYTES_PER_SEC;
+
+    const formData = new FormData();
+    formData.append("pcm", new Blob([snapshot], { type: "application/octet-stream" }), "window.pcm");
+    if (sessionOptions.language) formData.append("language", sessionOptions.language);
+    if (sessionOptions.task) formData.append("task", sessionOptions.task);
+    if (sessionOptions.model_size) formData.append("model_size", sessionOptions.model_size);
+
+    // Prime Whisper with the tail of already-committed text for continuity
+    const recentContext = committedSegments
+      .slice(-2)
+      .map((s) => s.text)
+      .join(" ");
+    const combinedPrompt = [sessionOptions.initial_prompt, recentContext]
+      .filter(Boolean)
+      .join(" ")
+      .trim();
+    if (combinedPrompt) {
+      formData.append("initial_prompt", combinedPrompt);
+    }
+
+    const res = await fetch(`${LOCAL_ENGINE_URL}/transcribe-pcm`, {
+      method: "POST",
+      body: formData
+    });
+
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data.language) detectedLanguage = data.language;
+
+    const segments = Array.isArray(data.segments) ? data.segments : [];
+    const tentativeParts = [];
+    let advanceSec = 0;
+
+    for (const seg of segments) {
+      const absStart = Number((snapshotStartSec + seg.start).toFixed(2));
+      const absEnd = Number((snapshotStartSec + seg.end).toFixed(2));
+
+      if (isFinal || snapshotDurationSec - seg.end >= COMMIT_LAG_SEC) {
+        committedSegments.push({
+          start: absStart,
+          end: absEnd,
+          text: seg.text
+        });
+        if (seg.end > advanceSec) {
+          advanceSec = seg.end;
+        }
+      } else {
+        tentativeParts.push(seg.text);
+      }
+    }
+
+    // Trim already-committed audio from the front of uncommittedBuffer
+    if (advanceSec > 0) {
+      const trimBytes = Math.min(
+        uncommittedBuffer.length,
+        Math.floor(advanceSec * SAMPLE_RATE) * 4
+      );
+      uncommittedBuffer = uncommittedBuffer.subarray(trimBytes);
+      bufferStartSec = Number((bufferStartSec + trimBytes / BYTES_PER_SEC).toFixed(2));
+    }
+
+    const committedText = committedSegments.map((s) => s.text).join(" ");
+    const tentativeText = tentativeParts.join(" ");
+
+    if (ws.readyState === ws.OPEN) {
+      ws.send(
+        JSON.stringify({
+          type: isFinal ? "final" : "progress",
+          committedText,
+          tentativeText,
+          text: [committedText, tentativeText].filter(Boolean).join(" "),
+          segments: committedSegments,
+          language: detectedLanguage
+        })
+      );
+    }
+  }
+
+  const tickInterval = setInterval(async () => {
+    if (isProcessing || !hasNewAudio) return;
+    isProcessing = true;
+    hasNewAudio = false;
+    try {
+      await processWindow(false);
     } catch (err) {
-      console.error("Live stream window error:", err);
+      console.error("Progressive stream tick error:", err);
     } finally {
       isProcessing = false;
     }
-  }, 1800);
+  }, 1600);
 
-  ws.on("message", (data, isBinary) => {
+  ws.on("message", async (data, isBinary) => {
     if (!isBinary) {
       try {
         const msg = JSON.parse(data.toString());
         if (msg.type === "config") {
           sessionOptions = { ...sessionOptions, ...(msg.options || {}) };
-          rollingBuffer = Buffer.alloc(0);
+          uncommittedBuffer = Buffer.alloc(0);
+          bufferStartSec = 0;
+          committedSegments = [];
+          detectedLanguage = null;
+        } else if (msg.type === "finalize") {
+          clearInterval(tickInterval);
+          // Wait briefly if an inference tick is mid-flight
+          while (isProcessing) {
+            await new Promise((r) => setTimeout(r, 80));
+          }
+          isProcessing = true;
+          try {
+            await processWindow(true);
+          } finally {
+            isProcessing = false;
+          }
         }
-      } catch {
-        // ignore malformed control message
+      } catch (err) {
+        console.error("Control message error:", err);
       }
       return;
     }
 
     const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data);
-    rollingBuffer = Buffer.concat([rollingBuffer, chunk]);
-    if (rollingBuffer.length > MAX_WINDOW_BYTES) {
-      rollingBuffer = rollingBuffer.subarray(rollingBuffer.length - MAX_WINDOW_BYTES);
+    uncommittedBuffer = Buffer.concat([uncommittedBuffer, chunk]);
+
+    // Safety cap if Whisper falls far behind on slow hardware
+    if (uncommittedBuffer.length > MAX_WINDOW_BYTES) {
+      const overflow = uncommittedBuffer.length - MAX_WINDOW_BYTES;
+      const alignedOverflow = overflow - (overflow % 4);
+      uncommittedBuffer = uncommittedBuffer.subarray(alignedOverflow);
+      bufferStartSec = Number((bufferStartSec + alignedOverflow / BYTES_PER_SEC).toFixed(2));
     }
     hasNewAudio = true;
   });
 
   ws.on("close", () => {
     clearInterval(tickInterval);
-    rollingBuffer = Buffer.alloc(0);
+    uncommittedBuffer = Buffer.alloc(0);
   });
 });
 
 const port = Number(process.env.PORT || 8787);
 server.listen(port, () => {
-  console.log(`Transcripto API + WebSocket listening on http://localhost:${port}`);
+  console.log(`Transcripto API + Progressive WebSocket listening on http://localhost:${port}`);
   console.log(`Routing transcription to ${LOCAL_ENGINE_URL}`);
 });

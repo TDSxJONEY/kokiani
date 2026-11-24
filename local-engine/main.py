@@ -131,12 +131,11 @@ async def transcribe_pcm(
     try:
         raw_bytes = await pcm.read()
         if not raw_bytes:
-            return {"text": "", "language": None}
+            return {"text": "", "language": None, "segments": []}
 
-        # Ensure byte length aligns to 4-byte float32 samples
         aligned_len = len(raw_bytes) - (len(raw_bytes) % 4)
         if aligned_len == 0:
-            return {"text": "", "language": None}
+            return {"text": "", "language": None, "segments": []}
 
         audio_np = np.frombuffer(raw_bytes[:aligned_len], dtype=np.float32).copy()
 
@@ -145,7 +144,6 @@ async def transcribe_pcm(
         task_arg = "translate" if (task and task.strip().lower() == "translate") else "transcribe"
         prompt_arg = initial_prompt.strip() if initial_prompt and initial_prompt.strip() else None
 
-        # Faster beam_size=2 for low-latency live window updates
         segments_gen, info = model.transcribe(
             audio_np,
             language=lang_arg,
@@ -158,10 +156,24 @@ async def transcribe_pcm(
             vad_parameters={"min_silence_duration_ms": 400},
         )
 
-        text_parts = [seg.text.strip() for seg in segments_gen if seg.text.strip()]
+        segments = []
+        text_parts = []
+        for seg in segments_gen:
+            cleaned = seg.text.strip()
+            if cleaned:
+                text_parts.append(cleaned)
+                segments.append(
+                    {
+                        "start": round(seg.start, 2),
+                        "end": round(seg.end, 2),
+                        "text": cleaned,
+                    }
+                )
+
         return {
             "text": " ".join(text_parts),
             "language": info.language,
+            "segments": segments,
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
